@@ -23,6 +23,7 @@ import {
   downloadText,
   energyOf,
   fitGaussian,
+  fitLinearCalibration,
   formatCsv,
   formatSeconds,
   formatTxt3,
@@ -37,6 +38,7 @@ import {
   calibMismatch,
   xOfBin,
   type GaussFit,
+  type LinearCalFit,
   type NetResult,
   type Spectrum,
 } from "@/lib/spectrum";
@@ -58,6 +60,14 @@ async function readFile(file: File): Promise<Spectrum> {
 function parseCoeff(raw: string): number | null {
   const v = Number(raw.trim());
   return Number.isFinite(v) ? v : null;
+}
+
+function formatCoeff(v: number): string {
+  if (!Number.isFinite(v)) return "";
+  const abs = Math.abs(v);
+  if (abs !== 0 && (abs < 1e-4 || abs >= 1e6)) return v.toExponential(6);
+  const s = v.toFixed(6);
+  return s.replace(/\.?0+$/, "") || "0";
 }
 
 function CoeffField({
@@ -301,7 +311,12 @@ export function SpectrumApp() {
   const [plotEpoch, setPlotEpoch] = useState(0);
   const [c0Draft, setC0Draft] = useState("");
   const [c1Draft, setC1Draft] = useState("");
-  const [cal, setCal] = useState<{ c0: number; c1: number } | null>(null);
+  const [cal, setCal] = useState<{ c0: number; c1: number; c2: number } | null>(null);
+  const [calPoints, setCalPoints] = useState<{ id: number; ch: number; energy: number }[]>([]);
+  const [calChDraft, setCalChDraft] = useState("");
+  const [calEDraft, setCalEDraft] = useState("");
+  const [calFit, setCalFit] = useState<LinearCalFit | null>(null);
+  const calPointId = useRef(1);
   const [roi, setRoi] = useState<{ i0: number; i1: number } | null>(null);
   const [roiFromDraft, setRoiFromDraft] = useState("");
   const [roiToDraft, setRoiToDraft] = useState("");
@@ -325,7 +340,7 @@ export function SpectrumApp() {
     }
     setC0Draft(String(src.c0));
     setC1Draft(String(src.c1));
-    setCal({ c0: src.c0, c1: src.c1 });
+    setCal({ c0: src.c0, c1: src.c1, c2: src.c2 });
   }, [meas, bg]);
 
   const net: NetResult | null = useMemo(() => {
@@ -352,9 +367,11 @@ export function SpectrumApp() {
       if (noisy) toast.error("C0 / C1 必须是有效数字");
       return false;
     }
-    setCal({ c0, c1 });
+    const c2 = cal?.c2 ?? fileCalSrc?.c2 ?? 0;
+    setCal({ c0, c1, c2 });
     setC0Draft(String(c0));
     setC1Draft(String(c1));
+    setCalFit(null);
     return true;
   };
 
@@ -362,24 +379,78 @@ export function SpectrumApp() {
     if (!fileCalSrc) return;
     setC0Draft(String(fileCalSrc.c0));
     setC1Draft(String(fileCalSrc.c1));
-    setCal({ c0: fileCalSrc.c0, c1: fileCalSrc.c1 });
+    setCal({ c0: fileCalSrc.c0, c1: fileCalSrc.c1, c2: fileCalSrc.c2 });
+    setCalFit(null);
+  };
+
+  const addCalPoint = (chRaw = calChDraft, eRaw = calEDraft) => {
+    const ch = parseCoeff(chRaw);
+    const energy = parseCoeff(eRaw);
+    if (ch === null || energy === null) {
+      toast.error("峰位（道址）和能量必须是有效数字");
+      return;
+    }
+    setCalPoints((prev) => {
+      const existing = prev.findIndex((p) => Math.abs(p.ch - ch) < 1e-6);
+      if (existing >= 0) {
+        const next = prev.slice();
+        next[existing] = { ...next[existing]!, ch, energy };
+        return next;
+      }
+      return [...prev, { id: calPointId.current++, ch, energy }];
+    });
+    setCalChDraft("");
+    setCalEDraft("");
+  };
+
+  const fillPeakAsCalCh = () => {
+    if (gaussFit) {
+      setCalChDraft(gaussFit.mu.toFixed(3));
+      return;
+    }
+    if (plotSpec && roi) {
+      const counts = net?.net ?? plotSpec.counts;
+      const iPeak = peakIndex(counts, roi.i0, roi.i1);
+      setCalChDraft(String(plotSpec.channel[iPeak]!));
+      return;
+    }
+    toast.error("请先框选 ROI，或对峰做高斯拟合后再填入峰位");
+  };
+
+  const fitCalFromPoints = () => {
+    try {
+      const fit = fitLinearCalibration(calPoints);
+      setCal({ c0: fit.c0, c1: fit.c1, c2: 0 });
+      setC0Draft(formatCoeff(fit.c0));
+      setC1Draft(formatCoeff(fit.c1));
+      setCalFit(fit);
+      toast.success(
+        `线性刻度 C0=${formatCoeff(fit.c0)}  C1=${formatCoeff(fit.c1)}  RMS=${fit.rms.toFixed(3)}`,
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "线性刻度拟合失败");
+    }
   };
 
   const measCal = useMemo(() => {
     if (!meas) return null;
     if (!cal) return meas;
-    return applyCalibration(meas, cal.c0, cal.c1, meas.c2);
+    return applyCalibration(meas, cal.c0, cal.c1, cal.c2);
   }, [meas, cal]);
 
   const bgCal = useMemo(() => {
     if (!bg) return null;
     if (!cal) return bg;
-    return applyCalibration(bg, cal.c0, cal.c1, bg.c2);
+    return applyCalibration(bg, cal.c0, cal.c1, cal.c2);
   }, [bg, cal]);
 
   const plotSpec = measCal ?? bgCal;
   const calCustom =
-    Boolean(fileCalSrc && cal && (cal.c0 !== fileCalSrc.c0 || cal.c1 !== fileCalSrc.c1));
+    Boolean(
+      fileCalSrc &&
+        cal &&
+        (cal.c0 !== fileCalSrc.c0 || cal.c1 !== fileCalSrc.c1 || cal.c2 !== fileCalSrc.c2),
+    );
 
   useEffect(() => {
     if (!plotSpec) {
@@ -749,7 +820,10 @@ export function SpectrumApp() {
                     setC0Draft(v);
                     const c0 = parseCoeff(v);
                     const c1 = parseCoeff(c1Draft);
-                    if (c0 !== null && c1 !== null) setCal({ c0, c1 });
+                    if (c0 !== null && c1 !== null) {
+                      setCal({ c0, c1, c2: cal?.c2 ?? plotSpec.c2 });
+                      setCalFit(null);
+                    }
                   }}
                   onCommit={() => commitCal(c0Draft, c1Draft, false)}
                 />
@@ -762,7 +836,10 @@ export function SpectrumApp() {
                     setC1Draft(v);
                     const c0 = parseCoeff(c0Draft);
                     const c1 = parseCoeff(v);
-                    if (c0 !== null && c1 !== null) setCal({ c0, c1 });
+                    if (c0 !== null && c1 !== null) {
+                      setCal({ c0, c1, c2: cal?.c2 ?? plotSpec.c2 });
+                      setCalFit(null);
+                    }
                   }}
                   onCommit={() => commitCal(c0Draft, c1Draft, false)}
                 />
@@ -776,6 +853,124 @@ export function SpectrumApp() {
                 <RotateCcw className="size-3.5" />
                 恢复文件刻度
               </Button>
+
+              <div className="mt-3 border-t border-border pt-3">
+                <p className="text-[11px] font-medium text-muted">刻度点</p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-subtle">
+                  峰位用道址，能量为已知值。≥2 点后最小二乘拟合 E = C0 + C1 · ch（C2 置 0）
+                </p>
+                {calPoints.length ? (
+                  <ul className="mt-2 space-y-1">
+                    {calPoints.map((p) => {
+                      const pred = cal
+                        ? energyOf(p.ch, cal.c0, cal.c1, cal.c2)
+                        : null;
+                      const d = pred !== null ? pred - p.energy : null;
+                      return (
+                        <li
+                          key={p.id}
+                          className="flex items-center gap-1.5 font-mono text-[11px] tabular text-fg"
+                        >
+                          <span className="min-w-0 flex-1 truncate">
+                            ch {p.ch} → {p.energy} {plotSpec.unit}
+                            {d !== null ? (
+                              <span className="text-subtle">
+                                {" "}
+                                Δ{d >= 0 ? "+" : ""}
+                                {d.toFixed(3)}
+                              </span>
+                            ) : null}
+                          </span>
+                          <button
+                            type="button"
+                            className="inline-flex size-8 shrink-0 items-center justify-center rounded-[var(--radius-sm)] text-muted hover:bg-surface-2 hover:text-fg"
+                            aria-label={`删除刻度点 ${p.ch}`}
+                            onClick={() =>
+                              setCalPoints((prev) => prev.filter((x) => x.id !== p.id))
+                            }
+                          >
+                            <X className="size-3.5" />
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : null}
+                <div className="mt-2 grid grid-cols-2 gap-2">
+                  <label htmlFor="cal-pt-ch" className="min-w-0">
+                    <div className="text-[11px] font-medium uppercase tracking-wider text-subtle">
+                      峰位
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-muted">道址 ch</div>
+                    <input
+                      id="cal-pt-ch"
+                      type="text"
+                      inputMode="decimal"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={calChDraft}
+                      onChange={(e) => setCalChDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          addCalPoint();
+                        }
+                      }}
+                      className="mt-1.5 h-11 w-full rounded-[var(--radius-sm)] border border-border bg-bg px-2.5 font-mono text-sm tabular text-fg outline-none focus:border-border-strong focus:ring-2 focus:ring-ring"
+                    />
+                  </label>
+                  <label htmlFor="cal-pt-e" className="min-w-0">
+                    <div className="text-[11px] font-medium uppercase tracking-wider text-subtle">
+                      能量
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-muted">{plotSpec.unit}</div>
+                    <input
+                      id="cal-pt-e"
+                      type="text"
+                      inputMode="decimal"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={calEDraft}
+                      onChange={(e) => setCalEDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          addCalPoint();
+                        }
+                      }}
+                      className="mt-1.5 h-11 w-full rounded-[var(--radius-sm)] border border-border bg-bg px-2.5 font-mono text-sm tabular text-fg outline-none focus:border-border-strong focus:ring-2 focus:ring-ring"
+                    />
+                  </label>
+                </div>
+                <div className="mt-2 flex flex-col gap-1.5">
+                  <Button variant="ghost" className="h-11 w-full" onClick={() => addCalPoint()}>
+                    <Plus className="size-3.5" />
+                    添加刻度点
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    className="h-11 w-full"
+                    disabled={!gaussFit && !roi}
+                    onClick={fillPeakAsCalCh}
+                  >
+                    {gaussFit ? "填入拟合峰位" : "填入 ROI 峰位"}
+                  </Button>
+                  <Button
+                    className="h-11 w-full"
+                    disabled={calPoints.length < 2}
+                    onClick={fitCalFromPoints}
+                  >
+                    最小二乘拟合
+                  </Button>
+                </div>
+                {calFit ? (
+                  <p className="mt-2 font-mono text-[11px] leading-relaxed text-ok">
+                    C0={formatCoeff(calFit.c0)}　C1={formatCoeff(calFit.c1)}
+                    <br />
+                    RMS={calFit.rms.toFixed(4)} {plotSpec.unit}　R²={calFit.r2.toFixed(6)}　C2=0
+                  </p>
+                ) : null}
+              </div>
             </fieldset>
           ) : null}
 
@@ -804,6 +999,10 @@ export function SpectrumApp() {
                 setRoiFromDraft("");
                 setRoiToDraft("");
                 setGaussFit(null);
+                setCalPoints([]);
+                setCalChDraft("");
+                setCalEDraft("");
+                setCalFit(null);
               }}
             >
               <Eraser className="size-3.5" />
@@ -817,7 +1016,7 @@ export function SpectrumApp() {
               <li>导入本底谱 txt3</li>
               <li>导入测量谱，可多选或「追加」；计数与 LiveTime / RealTime 按道相加</li>
               <li>默认显示全部道址；F7 缩小、F8 放大，也可滚轮缩放</li>
-              <li>能量轴下可改 C0 / C1，能谱立即重绘</li>
+              <li>能量轴下可改 C0 / C1，或添加刻度点（峰位道址，已知能量）做最小二乘线性刻度</li>
               <li>填写 ROI，或 Alt/Ctrl+拖动框选；扣除结果显示该区间</li>
               <li>框选单个峰后点「高斯拟合」，得到拟合峰位、FWHM、峰面积</li>
             </ol>

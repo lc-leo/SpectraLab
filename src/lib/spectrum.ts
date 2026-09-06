@@ -70,6 +70,68 @@ export function applyCalibration(spec: Spectrum, c0: number, c1: number, c2 = sp
   return { ...spec, c0, c1, c2, energy };
 }
 
+export type CalPoint = {
+  ch: number;
+  energy: number;
+};
+
+export type LinearCalFit = {
+  c0: number;
+  c1: number;
+  n: number;
+  rms: number;
+  r2: number;
+  residuals: number[];
+};
+
+/** Ordinary least squares: E = C0 + C1 · ch. Requires ≥ 2 distinct channels. */
+export function fitLinearCalibration(points: CalPoint[]): LinearCalFit {
+  const n = points.length;
+  if (n < 2) throw new Error("至少需要 2 个刻度点做线性拟合");
+  let sx = 0;
+  let sy = 0;
+  let sxx = 0;
+  let sxy = 0;
+  for (const p of points) {
+    if (!Number.isFinite(p.ch) || !Number.isFinite(p.energy)) {
+      throw new Error("刻度点必须是有效数字");
+    }
+    sx += p.ch;
+    sy += p.energy;
+    sxx += p.ch * p.ch;
+    sxy += p.ch * p.energy;
+  }
+  const det = n * sxx - sx * sx;
+  if (!(Math.abs(det) > 1e-12 * (Math.abs(sxx) + 1))) {
+    throw new Error("刻度点的道址不能全部相同");
+  }
+  const c1 = (n * sxy - sx * sy) / det;
+  const c0 = (sy - c1 * sx) / n;
+  if (!Number.isFinite(c0) || !Number.isFinite(c1)) {
+    throw new Error("线性刻度拟合失败");
+  }
+  const meanY = sy / n;
+  let ssRes = 0;
+  let ssTot = 0;
+  const residuals: number[] = [];
+  for (const p of points) {
+    const pred = c0 + c1 * p.ch;
+    const r = pred - p.energy;
+    residuals.push(r);
+    ssRes += r * r;
+    const dy = p.energy - meanY;
+    ssTot += dy * dy;
+  }
+  return {
+    c0,
+    c1,
+    n,
+    rms: Math.sqrt(ssRes / n),
+    r2: ssTot > 0 ? 1 - ssRes / ssTot : 1,
+    residuals,
+  };
+}
+
 export function parseTxt3(text: string, filename: string): Spectrum {
   const cleaned = text.replace(/^\uFEFF/, "");
   const lines = cleaned.split(/\r?\n/);
