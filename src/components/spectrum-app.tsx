@@ -336,7 +336,6 @@ export function SpectrumApp() {
     () => (measSum ? applyGainFactor(measSum, driftScale) : null),
     [measSum, driftScale],
   );
-  const bgCorr = useMemo(() => (bg ? applyGainFactor(bg, driftScale) : null), [bg, driftScale]);
 
   const fileCalSrc = measSum ?? bg;
 
@@ -354,14 +353,14 @@ export function SpectrumApp() {
   }, [measSum, bg]);
 
   const net: NetResult | null = useMemo(() => {
-    if (!bgCorr || !meas) return null;
+    if (!bg || !meas) return null;
     try {
-      return subtractBackground(meas, bgCorr);
+      return subtractBackground(meas, bg);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "本底扣除失败");
       return null;
     }
-  }, [bgCorr, meas]);
+  }, [bg, meas]);
 
   const calWarn =
     bg && measSum && (bg.c0 !== measSum.c0 || bg.c1 !== measSum.c1 || bg.c2 !== measSum.c2)
@@ -470,13 +469,15 @@ export function SpectrumApp() {
       return;
     }
     try {
-      const src = measSum ?? bg;
-      if (!src) return;
-      applyGainFactor(src, driftFPreview);
+      if (!measSum) {
+        toast.error("峰漂修正只作用于测量谱，请先导入测量谱");
+        return;
+      }
+      applyGainFactor(measSum, driftFPreview);
       setDriftScale(driftFPreview);
       setGaussFit(null);
       setPlotEpoch((n) => n + 1);
-      toast.success(`峰漂修正 f=${formatCoeff(driftFPreview)}，ch′ᵢ = chᵢ × f`);
+      toast.success(`测量谱峰漂修正 f=${formatCoeff(driftFPreview)}，本底不修正`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "峰漂修正失败");
     }
@@ -494,10 +495,10 @@ export function SpectrumApp() {
   }, [meas, cal]);
 
   const bgCal = useMemo(() => {
-    if (!bgCorr) return null;
-    if (!cal) return bgCorr;
-    return applyCalibration(bgCorr, cal.c0, cal.c1, cal.c2);
-  }, [bgCorr, cal]);
+    if (!bg) return null;
+    if (!cal) return bg;
+    return applyCalibration(bg, cal.c0, cal.c1, cal.c2);
+  }, [bg, cal]);
 
   const plotSpec = measCal ?? bgCal;
   const calCustom =
@@ -653,7 +654,7 @@ export function SpectrumApp() {
     if (meas && net && plotMode === "overlay") {
       return [
         { id: "meas", label: "测量谱", color: totalColor, counts: meas.counts, fill: true },
-        { id: "bg", label: "本底 (× LiveTime)", color: bgColor, counts: net.scaledBg },
+        { id: "bg", label: "本地谱", color: bgColor, counts: net.scaledBg },
         { id: "net", label: "净谱", color: netColor, counts: net.net },
       ];
     }
@@ -663,11 +664,11 @@ export function SpectrumApp() {
     if (meas) {
       return [{ id: "meas", label: "测量谱", color: totalColor, counts: meas.counts, fill: true }];
     }
-    if (bgCorr) {
-      return [{ id: "bg", label: "本底", color: bgColor, counts: bgCorr.counts, fill: true }];
+    if (bg) {
+      return [{ id: "bg", label: "本底", color: bgColor, counts: bg.counts, fill: true }];
     }
     return [];
-  }, [plotSpec, meas, bgCorr, net, plotMode]);
+  }, [plotSpec, meas, bg, net, plotMode]);
 
   const ingestMeas = async (files: File[], mode: "replace" | "append") => {
     try {
@@ -746,7 +747,7 @@ export function SpectrumApp() {
             <span className="hidden text-xs text-subtle sm:inline">CoMPASS txt3 · 本底扣除</span>
           </div>
           <p className="mt-0.5 text-xs text-muted">
-            每道本底计数率 × 测量 LiveTime，再从测量谱扣除
+            CoMPASS txt3 能谱分析
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -1045,7 +1046,7 @@ export function SpectrumApp() {
                 ch′ᵢ = chᵢ × f
               </p>
               <p className="mt-1 text-[11px] leading-relaxed text-subtle">
-                初始峰位 ch0、当前峰位 ch。应用后整条谱的道址乘以 f，当前峰移到 ch0；计数按道守恒再分箱。
+                仅修正测量谱，本底谱不改。应用后测量谱道址乘以 f，当前峰移到 ch0；计数按道守恒再分箱。
               </p>
               <div className="mt-3 grid grid-cols-2 gap-2">
                 <CoeffField
@@ -1086,7 +1087,11 @@ export function SpectrumApp() {
                 >
                   {gaussFit ? "填入拟合峰位 → ch" : "填入 ROI 峰位 → ch"}
                 </Button>
-                <Button className="h-11 w-full" disabled={driftFPreview === null} onClick={applyDrift}>
+                <Button
+                  className="h-11 w-full"
+                  disabled={driftFPreview === null || !measSum}
+                  onClick={applyDrift}
+                >
                   应用修正
                 </Button>
                 <Button
@@ -1147,7 +1152,7 @@ export function SpectrumApp() {
               <li>导入测量谱，可多选或「追加」；计数与 LiveTime / RealTime 按道相加</li>
               <li>默认显示全部道址；F7 缩小、F8 放大，也可滚轮缩放</li>
               <li>能量轴下可改 C0 / C1，或添加刻度点（峰位道址，已知能量）做最小二乘线性刻度</li>
-              <li>峰漂修正：输入初始峰位 ch0 与当前峰位 ch，f = ch0/ch，道址 ch′ = ch × f</li>
+              <li>峰漂修正只作用于测量谱（本底不改）：f = ch0/ch，道址 ch′ = ch × f</li>
               <li>填写 ROI，或 Alt/Ctrl+拖动框选；扣除结果显示该区间</li>
               <li>框选单个峰后点「高斯拟合」，得到拟合峰位、FWHM、峰面积</li>
             </ol>
