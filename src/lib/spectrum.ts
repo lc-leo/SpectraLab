@@ -70,6 +70,60 @@ export function applyCalibration(spec: Spectrum, c0: number, c1: number, c2 = sp
   return { ...spec, c0, c1, c2, energy };
 }
 
+/** Rebin histogram so each channel maps to ch′ = ch · f. Conserves total counts. */
+export function applyGainFactor(spec: Spectrum, f: number): Spectrum {
+  if (!Number.isFinite(f) || f <= 0) throw new Error("增益修正因子 f 必须大于 0");
+  if (Math.abs(f - 1) < 1e-15) return spec;
+  if (f < 0.25 || f > 4) throw new Error("增益因子偏离 1 过大（允许 0.25–4）");
+
+  const acc = new Map<number, number>();
+  const add = (bin: number, w: number) => {
+    if (!(w > 0) || !Number.isFinite(w)) return;
+    acc.set(bin, (acc.get(bin) ?? 0) + w);
+  };
+
+  for (let i = 0; i < spec.n; i++) {
+    const ch = spec.channel[i]!;
+    const c = spec.counts[i] ?? 0;
+    if (!(c > 0)) continue;
+    const a = ch * f;
+    const b = (ch + 1) * f;
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    const width = hi - lo;
+    if (!(width > 0)) {
+      add(Math.round(lo), c);
+      continue;
+    }
+    let x = lo;
+    while (x < hi) {
+      const bin = Math.floor(x + 1e-12);
+      const next = Math.min(hi, bin + 1);
+      if (next > x) add(bin, (c * (next - x)) / width);
+      if (next <= x) break;
+      x = next;
+    }
+  }
+
+  if (acc.size === 0) return spec;
+  const keys = Array.from(acc.keys()).sort((a, b) => a - b);
+  const iMin = keys[0]!;
+  const iMax = keys[keys.length - 1]!;
+  const n = iMax - iMin + 1;
+  if (n > spec.n * 8 + 32) throw new Error("增益因子过大，修正后道数过多");
+
+  const channel = new Int32Array(n);
+  const counts = new Float64Array(n);
+  const energy = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const ch = iMin + i;
+    channel[i] = ch;
+    counts[i] = acc.get(ch) ?? 0;
+    energy[i] = energyOf(ch, spec.c0, spec.c1, spec.c2);
+  }
+  return { ...spec, n, channel, counts, energy };
+}
+
 export type CalPoint = {
   ch: number;
   energy: number;

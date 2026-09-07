@@ -11,12 +11,14 @@ import {
   RotateCcw,
   Ruler,
   Scan,
+  MoveHorizontal,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SpectrumPlot, exportPlotPng, type CursorInfo, type PlotSeries } from "@/components/spectrum-plot";
 import {
   applyCalibration,
+  applyGainFactor,
   basename,
   centroidX,
   deadTimePercent,
@@ -317,6 +319,9 @@ export function SpectrumApp() {
   const [calEDraft, setCalEDraft] = useState("");
   const [calFit, setCalFit] = useState<LinearCalFit | null>(null);
   const calPointId = useRef(1);
+  const [driftCh0, setDriftCh0] = useState("");
+  const [driftCh, setDriftCh] = useState("");
+  const [driftScale, setDriftScale] = useState(1);
   const [roi, setRoi] = useState<{ i0: number; i1: number } | null>(null);
   const [roiFromDraft, setRoiFromDraft] = useState("");
   const [roiToDraft, setRoiToDraft] = useState("");
@@ -326,12 +331,17 @@ export function SpectrumApp() {
   const measAppendRef = useRef<HTMLInputElement>(null);
   const standalone = isStandaloneFile();
 
-  const meas = useMemo(() => (measRuns.length ? sumSpectra(measRuns) : null), [measRuns]);
+  const measSum = useMemo(() => (measRuns.length ? sumSpectra(measRuns) : null), [measRuns]);
+  const meas = useMemo(
+    () => (measSum ? applyGainFactor(measSum, driftScale) : null),
+    [measSum, driftScale],
+  );
+  const bgCorr = useMemo(() => (bg ? applyGainFactor(bg, driftScale) : null), [bg, driftScale]);
 
-  const fileCalSrc = meas ?? bg;
+  const fileCalSrc = measSum ?? bg;
 
   useEffect(() => {
-    const src = meas ?? bg;
+    const src = measSum ?? bg;
     if (!src) {
       setC0Draft("");
       setC1Draft("");
@@ -341,20 +351,20 @@ export function SpectrumApp() {
     setC0Draft(String(src.c0));
     setC1Draft(String(src.c1));
     setCal({ c0: src.c0, c1: src.c1, c2: src.c2 });
-  }, [meas, bg]);
+  }, [measSum, bg]);
 
   const net: NetResult | null = useMemo(() => {
-    if (!bg || !meas) return null;
+    if (!bgCorr || !meas) return null;
     try {
-      return subtractBackground(meas, bg);
+      return subtractBackground(meas, bgCorr);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "本底扣除失败");
       return null;
     }
-  }, [bg, meas]);
+  }, [bgCorr, meas]);
 
   const calWarn =
-    bg && meas && (bg.c0 !== meas.c0 || bg.c1 !== meas.c1 || bg.c2 !== meas.c2)
+    bg && measSum && (bg.c0 !== measSum.c0 || bg.c1 !== measSum.c1 || bg.c2 !== measSum.c2)
       ? "两谱刻度系数不同，仍按道址对齐扣除。"
       : calibMismatch(measRuns)
         ? "测量谱之间刻度系数不同，仍按道址相加。"
@@ -432,6 +442,51 @@ export function SpectrumApp() {
     }
   };
 
+  const driftFPreview = (() => {
+    const a = parseCoeff(driftCh0);
+    const b = parseCoeff(driftCh);
+    if (a === null || b === null || b === 0) return null;
+    const f = a / b;
+    return Number.isFinite(f) && f > 0 ? f : null;
+  })();
+
+  const fillDriftCh = () => {
+    if (gaussFit) {
+      setDriftCh(gaussFit.mu.toFixed(3));
+      return;
+    }
+    if (plotSpec && roi) {
+      const counts = net?.net ?? plotSpec.counts;
+      const iPeak = peakIndex(counts, roi.i0, roi.i1);
+      setDriftCh(String(plotSpec.channel[iPeak]!));
+      return;
+    }
+    toast.error("请先框选 ROI，或对峰做高斯拟合后再填入当前峰位");
+  };
+
+  const applyDrift = () => {
+    if (driftFPreview === null) {
+      toast.error("初始峰位 ch0 与当前峰位 ch 必须是有效数字，且 ch ≠ 0");
+      return;
+    }
+    try {
+      const src = measSum ?? bg;
+      if (!src) return;
+      applyGainFactor(src, driftFPreview);
+      setDriftScale(driftFPreview);
+      setGaussFit(null);
+      setPlotEpoch((n) => n + 1);
+      toast.success(`峰漂修正 f=${formatCoeff(driftFPreview)}，ch′ᵢ = chᵢ × f`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "峰漂修正失败");
+    }
+  };
+
+  const clearDrift = () => {
+    setDriftScale(1);
+    setPlotEpoch((n) => n + 1);
+  };
+
   const measCal = useMemo(() => {
     if (!meas) return null;
     if (!cal) return meas;
@@ -439,10 +494,10 @@ export function SpectrumApp() {
   }, [meas, cal]);
 
   const bgCal = useMemo(() => {
-    if (!bg) return null;
-    if (!cal) return bg;
-    return applyCalibration(bg, cal.c0, cal.c1, cal.c2);
-  }, [bg, cal]);
+    if (!bgCorr) return null;
+    if (!cal) return bgCorr;
+    return applyCalibration(bgCorr, cal.c0, cal.c1, cal.c2);
+  }, [bgCorr, cal]);
 
   const plotSpec = measCal ?? bgCal;
   const calCustom =
@@ -608,11 +663,11 @@ export function SpectrumApp() {
     if (meas) {
       return [{ id: "meas", label: "测量谱", color: totalColor, counts: meas.counts, fill: true }];
     }
-    if (bg) {
-      return [{ id: "bg", label: "本底", color: bgColor, counts: bg.counts, fill: true }];
+    if (bgCorr) {
+      return [{ id: "bg", label: "本底", color: bgColor, counts: bgCorr.counts, fill: true }];
     }
     return [];
-  }, [plotSpec, meas, bg, net, plotMode]);
+  }, [plotSpec, meas, bgCorr, net, plotMode]);
 
   const ingestMeas = async (files: File[], mode: "replace" | "append") => {
     try {
@@ -623,6 +678,8 @@ export function SpectrumApp() {
         setRoi(null);
         setRoiFromDraft("");
         setRoiToDraft("");
+        setDriftScale(1);
+        setGaussFit(null);
       }
       const next = mode === "append" ? [...measRuns, ...parsed] : parsed;
       setMeasRuns(next);
@@ -974,6 +1031,76 @@ export function SpectrumApp() {
             </fieldset>
           ) : null}
 
+          {plotSpec ? (
+            <fieldset className="rounded-[var(--radius-md)] border border-border p-3">
+              <legend className="px-1 text-xs font-medium text-muted">
+                <span className="inline-flex items-center gap-1.5">
+                  <MoveHorizontal className="size-3.5" />
+                  峰漂修正
+                </span>
+              </legend>
+              <p className="font-mono text-[11px] text-muted">
+                f = ch0 / ch
+                <br />
+                ch′ᵢ = chᵢ × f
+              </p>
+              <p className="mt-1 text-[11px] leading-relaxed text-subtle">
+                初始峰位 ch0、当前峰位 ch。应用后整条谱的道址乘以 f，当前峰移到 ch0；计数按道守恒再分箱。
+              </p>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <CoeffField
+                  id="drift-ch0"
+                  label="ch0"
+                  hint="初始峰位"
+                  value={driftCh0}
+                  onChange={setDriftCh0}
+                  onCommit={() => {}}
+                />
+                <CoeffField
+                  id="drift-ch"
+                  label="ch"
+                  hint="当前峰位"
+                  value={driftCh}
+                  onChange={setDriftCh}
+                  onCommit={() => {}}
+                />
+              </div>
+              <p className="mt-2 font-mono text-[11px] tabular text-muted">
+                {driftFPreview !== null ? (
+                  <>
+                    f = {formatCoeff(driftFPreview)}
+                    {Math.abs(driftScale - 1) > 1e-12 ? (
+                      <span className="text-ok">　已应用 {formatCoeff(driftScale)}</span>
+                    ) : null}
+                  </>
+                ) : (
+                  <span className="text-subtle">输入 ch0、ch 后显示 f</span>
+                )}
+              </p>
+              <div className="mt-2 flex flex-col gap-1.5">
+                <Button
+                  variant="ghost"
+                  className="h-11 w-full"
+                  disabled={!gaussFit && !roi}
+                  onClick={fillDriftCh}
+                >
+                  {gaussFit ? "填入拟合峰位 → ch" : "填入 ROI 峰位 → ch"}
+                </Button>
+                <Button className="h-11 w-full" disabled={driftFPreview === null} onClick={applyDrift}>
+                  应用修正
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="h-11 w-full"
+                  disabled={Math.abs(driftScale - 1) < 1e-12}
+                  onClick={clearDrift}
+                >
+                  清除修正
+                </Button>
+              </div>
+            </fieldset>
+          ) : null}
+
           <div className="flex flex-col gap-2">
             <Button onClick={exportNet} disabled={!net} className="h-11 w-full">
               导出净谱 txt3
@@ -1003,6 +1130,9 @@ export function SpectrumApp() {
                 setCalChDraft("");
                 setCalEDraft("");
                 setCalFit(null);
+                setDriftCh0("");
+                setDriftCh("");
+                setDriftScale(1);
               }}
             >
               <Eraser className="size-3.5" />
@@ -1017,6 +1147,7 @@ export function SpectrumApp() {
               <li>导入测量谱，可多选或「追加」；计数与 LiveTime / RealTime 按道相加</li>
               <li>默认显示全部道址；F7 缩小、F8 放大，也可滚轮缩放</li>
               <li>能量轴下可改 C0 / C1，或添加刻度点（峰位道址，已知能量）做最小二乘线性刻度</li>
+              <li>峰漂修正：输入初始峰位 ch0 与当前峰位 ch，f = ch0/ch，道址 ch′ = ch × f</li>
               <li>填写 ROI，或 Alt/Ctrl+拖动框选；扣除结果显示该区间</li>
               <li>框选单个峰后点「高斯拟合」，得到拟合峰位、FWHM、峰面积</li>
             </ol>
@@ -1236,6 +1367,11 @@ export function SpectrumApp() {
                   C1 <span className="text-fg">{plotSpec.c1}</span>
                 </span>
               </>
+            ) : null}
+            {Math.abs(driftScale - 1) > 1e-12 ? (
+              <span>
+                f <span className="text-fg">{formatCoeff(driftScale)}</span>
+              </span>
             ) : null}
             {cursor && plotSpec ? (
               <>

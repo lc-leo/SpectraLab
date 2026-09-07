@@ -1,6 +1,26 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { energyOf, fitLinearCalibration } from "./spectrum.ts";
+import { applyGainFactor, energyOf, fitLinearCalibration, integral, type Spectrum } from "./spectrum.ts";
+
+function specFrom(channels: number[], counts: number[]): Spectrum {
+  const n = channels.length;
+  const energy = Float64Array.from(channels, (ch) => energyOf(ch, 0, 1));
+  return {
+    name: "t",
+    c0: 0,
+    c1: 1,
+    c2: 0,
+    unit: "keV",
+    realTime: 1,
+    liveTime: 1,
+    realTimeRaw: "0:00:01.000",
+    liveTimeRaw: "0:00:01.000",
+    n,
+    channel: Int32Array.from(channels),
+    counts: Float64Array.from(counts),
+    energy,
+  };
+}
 
 describe("fitLinearCalibration", () => {
   it("recovers exact C0/C1 from two points", () => {
@@ -44,5 +64,39 @@ describe("fitLinearCalibration", () => {
         ]),
       /道址不能全部相同/,
     );
+  });
+});
+
+describe("applyGainFactor", () => {
+  it("is identity at f = 1", () => {
+    const s = specFrom([0, 1, 2], [4, 5, 6]);
+    assert.equal(applyGainFactor(s, 1), s);
+  });
+
+  it("conserves counts when stretching", () => {
+    const s = specFrom([0, 1, 2, 3, 4], [1, 2, 3, 2, 1]);
+    const out = applyGainFactor(s, 2);
+    assert.ok(Math.abs(integral(out.counts) - integral(s.counts)) < 1e-9);
+    assert.ok(out.channel[0]! >= 0);
+    assert.ok(out.n > 0);
+  });
+
+  it("moves a single-bin peak to ch · f", () => {
+    const s = specFrom([0, 1, 2, 10, 11], [0, 0, 0, 100, 0]);
+    const out = applyGainFactor(s, 1.5);
+    let peak = 0;
+    let yPeak = -Infinity;
+    for (let i = 0; i < out.n; i++) {
+      if ((out.counts[i] ?? 0) > yPeak) {
+        yPeak = out.counts[i]!;
+        peak = out.channel[i]!;
+      }
+    }
+    assert.equal(peak, 15);
+  });
+
+  it("rejects non-positive f", () => {
+    const s = specFrom([0, 1], [1, 1]);
+    assert.throws(() => applyGainFactor(s, 0), /大于 0/);
   });
 });
